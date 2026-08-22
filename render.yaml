@@ -17,7 +17,11 @@ services:
     name: airline-otp-api
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: free  # bump to a paid plan once this needs to stay warm / handle real traffic -- see DEPLOYMENT.md
+    plan: starter  # NOT free -- Render's free tier does not support persistent disks at all (confirmed
+    # via a real Blueprint deploy attempt: "disks are not supported for free tier services"), and this
+    # service needs one for the warehouse file. Starter is the cheapest disk-eligible plan: ~$7/mo base
+    # + $0.25/GB/mo for the disk below (~$9.50/mo total at 10GB). No way around this cost with Render
+    # given the warehouse's size -- see DEPLOYMENT.md if you want to compare against Railway instead.
     healthCheckPath: /api/health  # deliberately NOT /api/data-health -- that one queries the full warehouse and measured 5.3s locally; a platform health check needs to be instant, or a slow/constrained instance risks getting marked unhealthy and restarted
     envVars:
       - key: ANTHROPIC_API_KEY

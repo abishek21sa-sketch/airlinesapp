@@ -39,7 +39,13 @@ network access to actually run `next build`.
 ## 1. Backend API -- Render (recommended starting point)
 
 Render is the easier first deployment if you have no hosting experience --
-real free tier, straightforward Docker support, good docs.
+straightforward Docker support, good docs. NOT actually free for this app
+though: confirmed via a real deploy attempt that Render's free tier does
+not support persistent disks at all ("disks are not supported for free
+tier services"), and this service needs one for the warehouse file.
+`render.yaml` is set to the `starter` plan (~$7/mo base + $0.25/GB/mo for
+the disk, ~$9.50/mo total at the 10GB default) -- the cheapest plan that
+actually works here.
 
 ### 1.0: Verify the container actually RUNS (not just builds)
 
