@@ -31,9 +31,9 @@ services:
       - key: CLAUDE_MODEL_RESEARCHER
         value: claude-sonnet-5
       - key: CLAUDE_TIMEOUT_SECONDS
-        value: "35"
+        value: "60"  # 35 was too tight for claude-sonnet-5's extended thinking on hard multi-hop questions -- see api/copilot.py
       - key: CLAUDE_MAX_TOKENS
-        value: "2048"
+        value: "8192"  # 2048 let thinking alone exhaust the budget before any visible text -- see api/copilot.py
       - key: CORS_ALLOWED_ORIGINS
         sync: false  # set to your real Vercel URL(s) once the frontend is deployed -- comma-separated if more than one
       - key: AIRLINE_DUCKDB_PATH

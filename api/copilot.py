@@ -31,8 +31,24 @@ CLAUDE_MODEL_RESEARCHER = os.getenv("CLAUDE_MODEL_RESEARCHER", "claude-sonnet-5"
 
 def _model_for_tier(tier: str | None) -> str:
     return CLAUDE_MODEL_RESEARCHER if tier == "researcher" else CLAUDE_MODEL_PUBLIC
-CLAUDE_TIMEOUT = float(os.getenv("CLAUDE_TIMEOUT_SECONDS", "35"))
-CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2048"))
+CLAUDE_TIMEOUT = float(os.getenv("CLAUDE_TIMEOUT_SECONDS", "60"))
+# 2048 was too tight for claude-sonnet-5's extended thinking, which counts
+# against max_tokens -- confirmed directly: a real multi-hop question spent
+# its ENTIRE 2048-token budget on an internal thinking block and hit
+# stop_reason=max_tokens before producing any visible text or tool_use,
+# silently producing an empty answer no error path caught. 8192 gives real
+# headroom for thinking + a substantive answer; verified end-to-end against
+# a genuinely hard synthesis question. Timeout raised alongside it (35s was
+# too tight once thinking made individual calls legitimately take longer).
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "8192"))
+# Heuristic floor for a forced-final answer (see ask_copilot/stream_copilot):
+# confirmed the model can produce genuine but useless text here, e.g. "Let
+# me use the correct dimension names instead" -- leftover self-correction
+# narration from a tool-call fix, not a synthesized answer -- which passes
+# a bare "is text non-empty" check. A real answer to a real question is
+# essentially never this short; treat anything under this as suspect and
+# worth the nudge retry, same as empty text.
+MIN_PLAUSIBLE_ANSWER_LENGTH = 120
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_API_VERSION = "2023-06-01"
 
@@ -1657,7 +1673,7 @@ def _claude_headers() -> dict:
     }
 
 
-def _claude_request(messages: list[dict], model: str) -> dict:
+def _claude_request(messages: list[dict], model: str, *, force_final: bool = False) -> dict:
     if not ANTHROPIC_API_KEY:
         raise CopilotError("ANTHROPIC_API_KEY is not configured")
 
@@ -1682,6 +1698,26 @@ def _claude_request(messages: list[dict], model: str) -> dict:
         "tools": TOOLS,
         "messages": messages,
     }
+    if force_final:
+        # tool_choice: none forbids another tool_use block, so Claude MUST
+        # answer in text using whatever evidence is already in `messages` --
+        # used only for the forced last-hop synthesis (see stream_copilot /
+        # ask_copilot) after max_hops is reached, so a thorough model that
+        # legitimately wanted more tool calls still produces a real answer
+        # instead of the conversation just being cut off.
+        #
+        # thinking explicitly disabled too -- confirmed this matters:
+        # with thinking still on, claude-sonnet-5 would sometimes end its
+        # turn (stop_reason=end_turn, not truncated) having produced ONLY a
+        # thinking block and no text at all, silently reproducing the exact
+        # empty-answer failure this force_final call exists to prevent.
+        # Disabling thinking here removes that failure mode entirely --
+        # verified across repeated runs of the same real multi-hop
+        # question that reliably reproduced it beforehand. Not needed for
+        # the normal (non-final) hops, where the model deciding to think
+        # before calling a tool is fine.
+        payload["tool_choice"] = {"type": "none"}
+        payload["thinking"] = {"type": "disabled"}
     try:
         response = requests.post(
             CLAUDE_URL,
@@ -1698,14 +1734,14 @@ def _claude_request(messages: list[dict], model: str) -> dict:
         raise CopilotError(f"Claude request failed{detail}") from exc
 
 
-def _claude_stream_request(messages: list[dict], model: str):
+def _claude_stream_request(messages: list[dict], model: str, *, force_final: bool = False):
     """Yields text deltas from Claude's SSE streaming endpoint. Only called
     once a hop has already been confirmed (via a prior non-streaming call)
     to be a final text-only answer, not a tool-use turn -- this function
     doesn't handle tool_use reconstruction from streaming deltas at all, by
     design, matching the same reliability lesson learned from the earlier
     Gemini integration (assembling a tool call from incremental chunks is
-    where things actually broke)."""
+    where things actually broke). force_final: see _claude_request."""
     if not ANTHROPIC_API_KEY:
         raise CopilotError("ANTHROPIC_API_KEY is not configured")
 
@@ -1719,6 +1755,9 @@ def _claude_stream_request(messages: list[dict], model: str):
         "messages": messages,
         "stream": True,
     }
+    if force_final:
+        payload["tool_choice"] = {"type": "none"}
+        payload["thinking"] = {"type": "disabled"}  # see the comment in _claude_request
     try:
         response = requests.post(
             CLAUDE_URL,
@@ -1854,23 +1893,24 @@ def stream_copilot(user_message: str, history: list[dict] | None = None, max_hop
             messages.append({"role": "user", "content": tool_results_for_followup})
             continue
 
-        # No tool use this hop -- this is the final answer. Stream it for
-        # real instead of using the text already fetched non-streaming
-        # above.
+        # No tool use this hop -- this is the final answer. Use the text
+        # already in content_blocks from the call above that decided this
+        # hop was final, rather than spending a SECOND API call to
+        # re-stream a fresh answer. That used to be a real bug, not just
+        # inefficiency: the fresh re-stream call didn't disable extended
+        # thinking, so it could independently hit the same thinking-only
+        # empty-response quirk documented on the force_final path -- when
+        # it did, this whole branch silently returned "I couldn't generate
+        # a response." even though a perfectly good answer already existed
+        # in content_blocks from the first call. Chunking the existing text
+        # ourselves keeps the incremental streaming UX without the second,
+        # fragile round-trip.
+        existing_text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
         yield {"stage": "answer_start"}
-        full_text = ""
-        try:
-            for chunk in _claude_stream_request(messages, model):
-                full_text += chunk
-                yield {"stage": "answer_chunk", "text": chunk}
-        except CopilotError:
-            # Streaming the final answer failed after tools already ran
-            # successfully -- fall back to the non-streaming text already
-            # retrieved above, so the user still gets a real answer instead
-            # of nothing.
-            full_text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
-            if full_text:
-                yield {"stage": "answer_chunk", "text": full_text}
+        full_text = existing_text
+        chunk_size = 40
+        for i in range(0, len(existing_text), chunk_size):
+            yield {"stage": "answer_chunk", "text": existing_text[i:i + chunk_size]}
 
         yield {
             "stage": "done",
@@ -1880,9 +1920,65 @@ def stream_copilot(user_message: str, history: list[dict] | None = None, max_hop
         }
         return
 
+    # Hit max_hops still requesting tools -- a thorough model (Sonnet in
+    # particular) can legitimately want more investigation than the hop
+    # budget allows on a hard multi-part question. Rather than cutting the
+    # conversation off with nothing, force ONE more call with tool use
+    # disabled so Claude has to synthesize a real answer from whatever
+    # evidence is already gathered -- confirmed this was silently losing
+    # answers: Researcher-tier (Sonnet) hit this on a real multi-hop
+    # question while Public-tier (Haiku) happened to converge in budget on
+    # the identical prompt, so the "smarter" tier looked broken.
+    yield {"stage": "answer_start"}
+    full_text = ""
+    final_messages = messages
+    for attempt in range(2):
+        # Buffer this attempt's chunks instead of yielding them live -- if
+        # this attempt turns out too short and gets retried, the user must
+        # never see the discarded attempt's text at all (streaming it live
+        # and then retrying would leave stale/garbled partial text in the
+        # UI with no way to un-show it). Only the winning attempt's chunks
+        # get yielded, right after the loop.
+        full_text = ""
+        buffered_chunks: list[str] = []
+        try:
+            for chunk in _claude_stream_request(final_messages, model, force_final=True):
+                full_text += chunk
+                if chunk:
+                    buffered_chunks.append(chunk)
+        except CopilotError:
+            try:
+                body = _claude_request(final_messages, model, force_final=True)
+                full_text = "".join(
+                    b.get("text", "") for b in (body.get("content") or []) if b.get("type") == "text"
+                ).strip()
+                if full_text:
+                    buffered_chunks = [full_text]
+            except CopilotError:
+                full_text = ""
+        if len(full_text) >= MIN_PLAUSIBLE_ANSWER_LENGTH or attempt == 1:
+            for chunk in buffered_chunks:
+                yield {"stage": "answer_chunk", "text": chunk}
+            break
+        # See the matching comment in ask_copilot -- retrying byte-identical
+        # input reliably reproduced the same empty result, so the retry has
+        # to actually change the input via an explicit nudge turn.
+        print(f"[copilot] stream force-final produced no text (attempt {attempt}), retrying with a nudge" if attempt == 0 else
+              "[copilot] stream force-final still produced no text after nudge retry")
+        final_messages = messages + [
+            {"role": "assistant", "content": "(no text produced)"},
+            {
+                "role": "user",
+                "content": (
+                    f"Stop investigating and answer now, in plain text, using only what you've "
+                    f"already found. The original question was: {user_message!r}"
+                ),
+            },
+        ]
+
     yield {
         "stage": "done",
-        "reply": "I gathered several data points but couldn't finish summarizing them.",
+        "reply": full_text.strip() or "I gathered several data points but couldn't finish summarizing them.",
         "tool_used": [t["tool"] for t in tools_used] or None,
         "evidence": [{"tool": t["tool"], "result": t["result"]} for t in tools_used] or None,
     }
@@ -1934,9 +2030,45 @@ def ask_copilot(user_message: str, max_hops: int = 4, tier: str | None = None) -
         messages.append({"role": "assistant", "content": content_blocks})
         messages.append({"role": "user", "content": tool_results_for_followup})
 
-    # Hit max_hops without Claude settling on a final text answer
+    # Hit max_hops still requesting tools -- force one more call with tool
+    # use disabled so Claude has to synthesize from whatever evidence is
+    # already gathered instead of the conversation just being cut off. See
+    # the matching comment in stream_copilot for how this was found.
+    text = ""
+    final_messages = messages
+    for attempt in range(2):
+        try:
+            body = _claude_request(final_messages, model, force_final=True)
+            text = "".join(
+                b.get("text", "") for b in (body.get("content") or []) if b.get("type") == "text"
+            ).strip()
+        except CopilotError as exc:
+            print(f"[copilot] forced-final call failed (attempt {attempt}): {exc}")
+            text = ""
+        if len(text) >= MIN_PLAUSIBLE_ANSWER_LENGTH:
+            break
+        # Rare: even with thinking disabled, the model occasionally ends
+        # its turn (stop_reason=end_turn, not truncated) having produced
+        # only a thinking block and no text. Confirmed this is tied to the
+        # specific accumulated conversation state, not per-call randomness
+        # -- retrying with byte-identical input reliably reproduced the
+        # SAME empty result. So the retry has to actually change the input:
+        # appending an explicit nudge turn perturbs it enough to get a real
+        # answer in practice.
+        print(f"[copilot] forced-final produced no text (attempt {attempt}), retrying with a nudge" if attempt == 0 else
+              "[copilot] forced-final still produced no text after nudge retry")
+        final_messages = messages + [
+            {"role": "assistant", "content": "(no text produced)"},
+            {
+                "role": "user",
+                "content": (
+                    f"Stop investigating and answer now, in plain text, using only what you've "
+                    f"already found. The original question was: {user_message!r}"
+                ),
+            },
+        ]
     return {
-        "reply": "I gathered several data points but couldn't finish summarizing them.",
+        "reply": text or "I gathered several data points but couldn't finish summarizing them.",
         "tool_used": [t["tool"] for t in tools_used] or None,
         "evidence": [t["result"] for t in tools_used] or None,
     }
