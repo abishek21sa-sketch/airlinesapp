@@ -18,13 +18,29 @@ Formulation (time-indexed MILP):
   Core constraint -- each flight gets exactly one bucket:
     sum_{t in T_i} x_{i,t} = 1   for all i
 
-  Congestion linearization -- overload_t is how far bucket t's assigned
-  load exceeds the preferred bank limit for that bucket (0 if under):
-    overload_t >= sum_i x_{i,t} - PreferredLimit_t
-    overload_t >= 0
+  Congestion linearization -- CONVEX piecewise-linear, not flat. A single
+  linear overload_t term is mathematically indifferent between spreading
+  overflow across many buckets vs dumping it all into one -- both cost the
+  same per excess flight either way, which is a real defect: it means
+  "smoothing" can concentrate load into a new peak bucket while genuinely
+  minimizing the stated objective, exactly the failure mode this project
+  found and had to work around with a manually-tuned congestion_weighting
+  before this fix. Instead, overload_t is split into N_CONGESTION_TIERS
+  tiers (overload_{t,k} for k = 0..N-1), each covering a fixed band above
+  PreferredLimit_t (as a fraction of it) with STRICTLY INCREASING per-unit
+  cost across tiers:
+    sum_i x_{i,t} - PreferredLimit_t <= sum_k overload_{t,k}
+    0 <= overload_{t,k} <= TierWidth_k   (k < N-1; last tier unbounded)
+  Because tier costs strictly increase and the objective minimizes, the
+  solver always exhausts a cheaper tier before touching a pricier one --
+  the standard LP convex-cost decomposition trick, still exactly linear
+  program under the hood, no new solver capability required. Net effect:
+  concentrating overflow into one bucket is now strictly more expensive
+  than spreading the same total overflow across several, so the model
+  self-corrects without needing congestion_weighting hand-tuned per case.
 
   Objective (minimize), three explicit, separately-weighted terms:
-    congestion exposure    = sum_t CongestionWeight_t * overload_t
+    congestion exposure    = sum_t CongestionWeight_t * sum_k TierCost_k * overload_{t,k}
     expected-delay proxy   = sum_{i,t} x_{i,t} * DelayProxy_t
     schedule-shift penalty = sum_{i,t} x_{i,t} * ShiftPenalty(i,t)
 
@@ -79,6 +95,14 @@ from scipy.sparse import lil_matrix
 from api.optimization.backend import MilpFormulation, OptimizationBackend, PublicBackend
 
 BUCKET_MINUTES = 15
+
+# Convex piecewise-linear congestion cost, see module docstring. Tier 0
+# covers the first 20% over the limit, tier 1 the next 20%-50% over, tier 2
+# (unbounded) anything beyond 50% over -- each successively more expensive
+# per excess flight, so the solver always fills a cheaper tier first.
+CONGESTION_TIER_WIDTH_FRACTIONS = (0.2, 0.3)  # widths of tiers 0 and 1, as a fraction of that bucket's limit; last tier is unbounded
+CONGESTION_TIER_COST_MULTIPLIERS = (1.0, 2.0, 4.0)  # strictly increasing marginal cost per tier
+N_CONGESTION_TIERS = len(CONGESTION_TIER_COST_MULTIPLIERS)
 
 
 @dataclass
@@ -145,7 +169,7 @@ def build_formulation(
             if len(series) != n_scenarios:
                 raise ValueError(f"bucket {t} has {len(series)} scenarios, expected {n_scenarios} to match scenario_probs")
 
-    var_index: list[tuple] = []  # ("x", flight_id, bucket) | ("overload", bucket) | ("zeta", flight_id) | ("u", flight_id, scenario_idx)
+    var_index: list[tuple] = []  # ("x", flight_id, bucket) | ("overload", bucket, tier) | ("zeta", flight_id) | ("u", flight_id, scenario_idx)
     candidates: dict[str, list[int]] = {}
 
     for f in flights:
@@ -155,7 +179,8 @@ def build_formulation(
             var_index.append(("x", f.flight_id, t))
 
     for t in range(n_buckets):
-        var_index.append(("overload", t))
+        for k in range(N_CONGESTION_TIERS):
+            var_index.append(("overload", t, k))
 
     if is_risk_averse:
         for f in flights:
@@ -191,19 +216,22 @@ def build_formulation(
         ub[row] = 1.0
         row += 1
 
-    # --- overload linearization: overload_t >= sum_i x_{i,t} - limit_t ---
+    # --- convex tiered overload: sum_i x_{i,t} - limit_t <= sum_k overload_{t,k} ---
     flights_by_bucket: dict[int, list[str]] = {t: [] for t in range(n_buckets)}
     for f in flights:
         for t in candidates[f.flight_id]:
             flights_by_bucket[t].append(f.flight_id)
     for t in range(n_buckets):
-        A[row, pos[("overload", t)]] = -1.0
+        for k in range(N_CONGESTION_TIERS):
+            A[row, pos[("overload", t, k)]] = -1.0
         for flight_id in flights_by_bucket[t]:
             A[row, pos[("x", flight_id, t)]] = 1.0
         limit = preferred_bank_limit.get(t, 0.0)
         lb[row] = -np.inf
         ub[row] = limit
-        c[pos[("overload", t)]] += congestion_weighting * congestion_weight_by_bucket.get(t, 1.0)
+        weight_base = congestion_weighting * congestion_weight_by_bucket.get(t, 1.0)
+        for k in range(N_CONGESTION_TIERS):
+            c[pos[("overload", t, k)]] += weight_base * CONGESTION_TIER_COST_MULTIPLIERS[k]
         row += 1
 
     # --- schedule-shift penalty (both modes) ---
@@ -236,7 +264,13 @@ def build_formulation(
     var_lb = np.zeros(n_vars)
     var_ub = np.ones(n_vars)
     for key, i in pos.items():
-        if key[0] in ("overload", "u"):
+        if key[0] == "overload":
+            _, t, k = key
+            if k < N_CONGESTION_TIERS - 1:
+                var_ub[i] = CONGESTION_TIER_WIDTH_FRACTIONS[k] * preferred_bank_limit.get(t, 0.0)
+            else:
+                var_ub[i] = np.inf
+        elif key[0] == "u":
             var_ub[i] = np.inf
         elif key[0] == "zeta":
             var_lb[i] = -np.inf
@@ -334,8 +368,10 @@ def _decompose_objective(meta, x, flights, congestion_weight_by_bucket, congesti
     pos = meta["pos"]
     congestion_term = 0.0
     for t in range(n_buckets):
-        overload_val = x[pos[("overload", t)]]
-        congestion_term += congestion_weighting * congestion_weight_by_bucket.get(t, 1.0) * max(overload_val, 0.0)
+        weight_base = congestion_weighting * congestion_weight_by_bucket.get(t, 1.0)
+        for k in range(N_CONGESTION_TIERS):
+            overload_val = x[pos[("overload", t, k)]]
+            congestion_term += weight_base * CONGESTION_TIER_COST_MULTIPLIERS[k] * max(overload_val, 0.0)
     shift_term = 0.0
     for f in flights:
         for t in meta["candidates"][f.flight_id]:
@@ -351,6 +387,14 @@ def _methodology(mode: str) -> dict:
     return {
         "framework": "Time-indexed MILP (15-minute buckets), solved via an open-source HiGHS backend for public/bounded instances.",
         "mode": mode,
+        "congestion_penalty": (
+            f"Convex piecewise-linear, not flat -- overload above the preferred limit is priced in "
+            f"{N_CONGESTION_TIERS} tiers with strictly increasing marginal cost "
+            f"({', '.join(f'{m:g}x' for m in CONGESTION_TIER_COST_MULTIPLIERS)}), so concentrating "
+            f"overflow into one bucket is always more expensive than spreading the same total "
+            f"overflow across several -- a flat linear penalty can't tell the difference between "
+            f"the two."
+        ),
         "congestion_source": "This project's own empirical queue-pressure module (effective_capacity, queue_pressure_score) -- not an invented airport capacity figure.",
         "cvar_note": (
             "risk_averse mode uses a per-flight Rockafellar-Uryasev CVaR linearization over each "

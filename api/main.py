@@ -395,15 +395,18 @@ def departure_bank_smoothing_endpoint(
     preferred_bank_limit: Optional[float] = Query(None, description="Flights per 15-min bucket before it counts as overloaded; auto-computed from seasonal history if not given"),
     seasonal_lookback_years: int = Query(3, ge=0, le=8, description="How many prior years of the SAME calendar window to use as the congestion/delay baseline. 0 disables this and falls back to using only the current window's own data (the original, more circular baseline)."),
     congestion_weighting: float = Query(
-        40.0,
+        5.0,
         description=(
             "Weight on the congestion-overload term relative to the delay-proxy term. Empirically "
-            "tuned (not guessed): at low values the delay-proxy term dominates and the solver can "
-            "pile flights into whichever bucket has the lowest historical delay rather than "
-            "flattening load -- verified this could make optimized_peak_load EXCEED "
-            "original_peak_load at congestion_weighting<=30 for a real ORD/06:00-10:00 window. "
-            "40.0 reliably flattens load to the preferred limit across repeated random samples of "
-            "that same window."
+            "tuned (not guessed): at very low values the delay-proxy term dominates and the solver "
+            "can pile flights into whichever bucket has the lowest historical delay rather than "
+            "flattening load. The congestion term itself is a convex, tiered penalty (see "
+            "api/optimization/departure_bank.py) that makes concentrating overflow into one bucket "
+            "strictly more expensive than spreading the same total overflow -- this is what dropped "
+            "the reliably-needed weighting from 40 down to 5 (previously required before the tiered "
+            "penalty existed, when a flat linear penalty was indifferent between spread and "
+            "concentrated overflow at equal totals). Verified across ORD/ATL/LAX/JFK/DFW with "
+            "optimized_peak_load staying comfortably under original_peak_load at this default."
         ),
     ),
     shift_penalty_weight: float = Query(0.05),

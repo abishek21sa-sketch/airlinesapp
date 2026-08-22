@@ -23,7 +23,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from api.optimization.departure_bank import BankFlight, solve_departure_bank
+from api.optimization.departure_bank import (
+    BankFlight,
+    CONGESTION_TIER_COST_MULTIPLIERS,
+    CONGESTION_TIER_WIDTH_FRACTIONS,
+    N_CONGESTION_TIERS,
+    build_formulation,
+    solve_departure_bank,
+)
 
 
 class TestCongestionSmoothing:
@@ -123,6 +130,93 @@ class TestRiskAverseModeChangesTheDecision:
         # EXPECTED to pick bucket 19 (undisclosed = artificially risk-free),
         # not a sign the test or the code is broken.
         assert result.assignments[0]["assigned_bucket"] == 19
+
+
+class TestConvexCongestionPenalty:
+    """The congestion penalty was flat/linear before this fix -- meaning the
+    solver was mathematically indifferent between spreading overflow across
+    several buckets vs dumping the same total overflow into one, which is
+    exactly why congestion_weighting needed manual tuning to avoid the
+    solver concentrating flights into a new peak bucket (see the departure
+    bank smoothing session notes). It's now a convex, tiered penalty:
+    strictly increasing marginal cost per tier, so the same total overload
+    costs MORE when concentrated than when spread. Tested directly against
+    the objective coefficients build_formulation produces, not indirectly
+    through solver behavior -- isolates the cost STRUCTURE itself from
+    whatever else the solver happens to trade off (delay proxy, shift
+    penalty) in a full solve."""
+
+    def _tier_fill_cost(self, total_overload: float, limit: float) -> float:
+        """Mirrors the solver's own cheapest-tier-first behavior: minimum
+        cost to cover `total_overload` using the tiers build_formulation
+        defines for a bucket with this `limit`."""
+        remaining = total_overload
+        cost = 0.0
+        for k in range(N_CONGESTION_TIERS - 1):
+            width = CONGESTION_TIER_WIDTH_FRACTIONS[k] * limit
+            used = min(remaining, width)
+            cost += used * CONGESTION_TIER_COST_MULTIPLIERS[k]
+            remaining -= used
+            if remaining <= 0:
+                return cost
+        cost += remaining * CONGESTION_TIER_COST_MULTIPLIERS[-1]
+        return cost
+
+    def test_concentrated_overflow_costs_more_than_spread_overflow(self):
+        """Same total overload (4 flights over limit), either all in one
+        bucket or split evenly across two -- concentrated must cost strictly
+        more under the tiered penalty. Under the OLD flat penalty these two
+        would cost exactly the same, which was the actual defect."""
+        limit = 10.0
+        concentrated_cost = self._tier_fill_cost(4.0, limit)
+        spread_cost = 2 * self._tier_fill_cost(2.0, limit)
+        assert concentrated_cost > spread_cost
+
+    def test_tier_coefficients_appear_correctly_in_the_formulation(self):
+        """Sanity check the actual objective vector build_formulation
+        produces matches CONGESTION_TIER_COST_MULTIPLIERS, strictly
+        increasing, for a real bucket."""
+        flights = [BankFlight(flight_id="F1", original_bucket=10)]
+        limit = {t: 10.0 for t in range(96)}
+        weight = {t: 1.0 for t in range(96)}
+        point_est = {t: 10.0 for t in range(96)}
+
+        formulation, meta = build_formulation(
+            flights, n_buckets=96, allowed_shift_minutes=15,
+            preferred_bank_limit=limit, congestion_weight_by_bucket=weight,
+            congestion_weighting=1.0, shift_penalty_weight=0.05, mode="expected",
+            bucket_delay_point_estimate=point_est,
+        )
+        pos = meta["pos"]
+        costs = [formulation.c[pos[("overload", 10, k)]] for k in range(N_CONGESTION_TIERS)]
+        assert costs == list(CONGESTION_TIER_COST_MULTIPLIERS)
+        assert costs == sorted(costs) and len(set(costs)) == len(costs)  # strictly increasing
+
+    def test_optimizer_prefers_spreading_when_both_are_equally_cheap_to_reach(self):
+        """8 flights all at bucket 40, free to move +-30min into 5 buckets
+        (38-42) all sharing the identical limit/delay proxy -- shift cost is
+        symmetric either way, so this isolates the congestion penalty's own
+        preference. With a flat penalty the solver would be indifferent
+        among any allocation hitting the same total overload; the tiered
+        penalty should make it spread across more than one bucket rather
+        than leave a single bucket far over the limit."""
+        flights = [BankFlight(flight_id=f"F{i}", original_bucket=40) for i in range(8)]
+        limit = {t: 3.0 for t in range(96)}
+        weight = {t: 1.0 for t in range(96)}
+        point_est = {t: 10.0 for t in range(96)}
+
+        result = solve_departure_bank(
+            flights, n_buckets=96, allowed_shift_minutes=30,
+            preferred_bank_limit=limit, congestion_weight_by_bucket=weight,
+            bucket_delay_point_estimate=point_est, congestion_weighting=1.0,
+            shift_penalty_weight=0.01, mode="expected",
+        )
+        assert result.status == "optimal"
+        # 8 flights over a limit of 3: concentrating all 8 in one bucket
+        # would leave a peak of 8; spreading should bring the peak down
+        # meaningfully below that even at unweighted (1.0) congestion cost.
+        assert result.optimized_peak_load < 8
+        assert len(result.optimized_bank_load) >= 2
 
 
 class TestInfeasibility:
