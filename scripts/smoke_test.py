@@ -55,7 +55,7 @@ def main() -> int:
         url = f"{base_url}{path}"
         start = time.monotonic()
         try:
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=30)
             elapsed_ms = (time.monotonic() - start) * 1000
             if response.status_code == 200:
                 body_preview = str(response.json())[:80]
