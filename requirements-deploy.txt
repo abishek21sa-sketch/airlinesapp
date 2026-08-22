@@ -1,0 +1,19 @@
+# Backend API deployment requirements -- deliberately leaner than the top-level
+# requirements.txt, which also covers the local data pipeline (Selenium, pandas)
+# and the internal analyst console (Streamlit, matplotlib). None of that runs in
+# the deployed API container -- confirmed via grep that api/*.py imports none of
+# it -- so it's excluded here to keep the image smaller and faster to build.
+#
+# The automated data-check pipeline (pipeline/auto_update.py, which needs a real
+# headless Chrome session) is intentionally NOT deployed -- see DEPLOYMENT.md for
+# why. It keeps running locally and its output (the warehouse file) gets pushed
+# to wherever this deployment reads AIRLINE_DUCKDB_PATH from.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+duckdb>=1.2.0
+numpy>=2.0.0
+scipy>=1.11.0
+requests>=2.31.0
+python-dotenv>=1.0.0

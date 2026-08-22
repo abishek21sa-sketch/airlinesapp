@@ -1,0 +1,46 @@
+# Render Blueprint for the backend API.
+# Using this file: in the Render dashboard, "New +" -> "Blueprint", point it
+# at this repo. Render reads this file and proposes the service below --
+# review it, fill in the secret env vars it can't know (marked sync: false),
+# and deploy. Equally fine to skip this file entirely and configure the
+# same service by hand in the dashboard -- this is a convenience, not a
+# requirement.
+#
+# Railway doesn't use this file -- it auto-detects the Dockerfile at the
+# repo root and builds from that directly with no separate config needed.
+# The persistent-disk and env-var setup below still applies conceptually;
+# it's just done through Railway's own dashboard (Volumes tab, Variables
+# tab) instead of a blueprint file.
+
+services:
+  - type: web
+    name: airline-otp-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free  # bump to a paid plan once this needs to stay warm / handle real traffic -- see DEPLOYMENT.md
+    healthCheckPath: /api/health  # deliberately NOT /api/data-health -- that one queries the full warehouse and measured 5.3s locally; a platform health check needs to be instant, or a slow/constrained instance risks getting marked unhealthy and restarted
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false  # set manually in the Render dashboard -- never in this file, never in the repo
+      - key: CLAUDE_MODEL_PUBLIC
+        value: claude-haiku-4-5
+      - key: CLAUDE_MODEL_RESEARCHER
+        value: claude-sonnet-5
+      - key: CLAUDE_TIMEOUT_SECONDS
+        value: "35"
+      - key: CLAUDE_MAX_TOKENS
+        value: "2048"
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false  # set to your real Vercel URL(s) once the frontend is deployed -- comma-separated if more than one
+      - key: AIRLINE_DUCKDB_PATH
+        value: /data/airline.duckdb  # matches the disk mount path below
+      - key: AIRLINE_CREATE_RUNTIME_DIRS
+        value: "0"  # this deployment only reads the warehouse -- no local pipeline directories needed
+      - key: COPILOT_RATE_LIMIT_MAX
+        value: "12"
+      - key: COPILOT_RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+    disk:
+      name: warehouse-data
+      mountPath: /data
+      sizeGB: 10  # check your actual airline.duckdb file size and size this above it, with real headroom

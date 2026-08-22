@@ -1,0 +1,39 @@
+# Secrets -- never commit real credentials. .env.example files are the
+# templates and ARE meant to be committed; anything else with .env in the
+# name is a real local file and must never leave this machine.
+.env
+.env.local
+*.env
+!.env.example
+!frontend/.env.local.example
+
+# The data warehouse -- multi-GB DuckDB file, doesn't belong in git at all.
+# Deploys separately, straight to the host's persistent disk (see
+# DEPLOYMENT.md). Committing this would make the repo enormous and every
+# clone/deploy painfully slow for no benefit.
+Data/
+Outputs/
+Logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+npm-debug.log*
+*.tsbuildinfo
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

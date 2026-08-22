@@ -1,0 +1,466 @@
+"use client";
+
+import { useState, useEffect, useRef, Suspense } from "react";
+import { useParams, useSearchParams } from "next/navigation";
+import Link from "next/link";
+import DateRangePreset from "../../components/DateRangePreset";
+import HealthBadge from "../../components/HealthBadge";
+import TrendChart from "../../components/TrendChart";
+import DelayCauseChart from "../../components/DelayCauseChart";
+import RouteChart from "../../components/RouteChart";
+import AirportChart from "../../components/AirportChart";
+import SchedulePaddingChart from "../../components/SchedulePaddingChart";
+import CodeshareChart from "../../components/CodeshareChart";
+import { carrierName, CARRIER_PROFILES } from "../../lib/carriers";
+import { useMode } from "../../lib/mode";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+function buildQuery(params: Record<string, string>): string {
+  const usp = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v) usp.set(k, v);
+  });
+  const qs = usp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+function autoGranularity(start: string, end: string): "day" | "week" | "month" | "year" {
+  if (!start || !end) return "month";
+  const startMs = new Date(start).getTime();
+  const endMs = new Date(end).getTime();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return "month";
+  const days = Math.abs(endMs - startMs) / (1000 * 60 * 60 * 24);
+  if (days <= 14) return "day";
+  if (days <= 180) return "week";
+  return "month";
+}
+
+function scoreColor(score: number): string {
+  if (score >= 80) return "#4f9d8f";
+  if (score >= 65) return "#e8a33d";
+  return "#c9563a";
+}
+
+const RESEARCHER_TABS = ["Health Score", "Trend", "Delays & Routes", "Schedule & Codeshare"] as const;
+type ResearcherTab = (typeof RESEARCHER_TABS)[number];
+
+export default function CarrierProfilePage() {
+  return (
+    <Suspense fallback={null}>
+      <CarrierProfilePageInner />
+    </Suspense>
+  );
+}
+
+function CarrierProfilePageInner() {
+  const params = useParams();
+  const searchParams = useSearchParams();
+  const code = String(params.code ?? "").toUpperCase();
+  const profile = CARRIER_PROFILES[code];
+  const { mode, setMode } = useMode();
+
+  // Carried over from a Quick Lookup elsewhere on the site (?start=...&end=...)
+  // -- initialized once from the URL, not reset on every render.
+  const [startDate, setStartDate] = useState(() => searchParams.get("start") ?? "");
+  const [endDate, setEndDate] = useState(() => searchParams.get("end") ?? "");
+  const [detail, setDetail] = useState<any>(null);
+  const [notFound, setNotFound] = useState(false);
+  const [error, setError] = useState(false);
+
+  const [padding, setPadding] = useState<any>(null);
+  const [paddingGranularity, setPaddingGranularity] = useState<"day" | "week" | "month" | "year">("month");
+  const [codeshare, setCodeshare] = useState<any>(null);
+  const [tab, setTab] = useState<ResearcherTab>("Health Score");
+
+  // No protection against out-of-order responses existed here before --
+  // confirmed via code review after a real bug report. Rapid filter
+  // changes (e.g. switching Filter-by, then Occasion, then Year in quick
+  // succession) fire multiple overlapping fetches; a full-history query
+  // (slow, millions of rows) started earlier could resolve AFTER a
+  // narrow date-range query (fast, few rows) started later, silently
+  // overwriting the correct, more recent result with a stale one. This
+  // token guards against exactly that -- only the response from the
+  // MOST RECENTLY STARTED load() is ever applied.
+  const loadTokenRef = useRef(0);
+
+  async function fetchPadding(granularity: "day" | "week" | "month" | "year") {
+    const qs = buildQuery({ carrier: code, start_date: startDate, end_date: endDate, granularity });
+    try {
+      const res = await fetch(`${API_BASE}/api/schedule-padding${qs}`);
+      setPadding(res.ok ? await res.json() : null);
+    } catch {
+      setPadding(null);
+    }
+  }
+
+  async function load() {
+    if (!code) return;
+    const token = ++loadTokenRef.current;
+    setNotFound(false);
+    setError(false);
+    try {
+      const qs = buildQuery({ carrier: code, start_date: startDate, end_date: endDate });
+      const res = await fetch(`${API_BASE}/api/carrier-detail${qs}`);
+      if (token !== loadTokenRef.current) return; // a newer request has since started -- discard this one
+      if (res.status === 404) {
+        setDetail(null);
+        setNotFound(true);
+        return;
+      }
+      if (!res.ok) throw new Error("not ok");
+      const data = await res.json();
+      if (token !== loadTokenRef.current) return;
+      setDetail(data);
+
+      // Researcher-only data -- no point fetching it in Public mode, where
+      // none of it is ever shown.
+      if (mode === "researcher") {
+        const autoG = autoGranularity(startDate, endDate);
+        setPaddingGranularity(autoG);
+        await fetchPadding(autoG);
+        if (token !== loadTokenRef.current) return;
+        try {
+          const csRes = await fetch(`${API_BASE}/api/codeshare${qs}`);
+          if (token !== loadTokenRef.current) return;
+          setCodeshare(csRes.ok ? await csRes.json() : null);
+        } catch {
+          if (token === loadTokenRef.current) setCodeshare(null);
+        }
+      }
+    } catch {
+      if (token === loadTokenRef.current) setError(true);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, startDate, endDate, mode]);
+
+  // Reset to full history on a genuine Public->Researcher SWITCH (the
+  // toggle button, mid-visit) -- but not on initial mount, which would
+  // otherwise immediately wipe out a date range carried over via URL
+  // params from a Quick Lookup elsewhere on the site. previousModeRef
+  // starts at null, not "public", specifically so the very first render
+  // never counts as a transition. hadCarriedParams is checked separately
+  // and never cleared -- the auto-switch below also looks like a genuine
+  // "public -> researcher" transition to previousModeRef, and without
+  // this guard it would wipe out the very dates it just carried over.
+  const hadCarriedParams = useRef(Boolean(searchParams.get("start") || searchParams.get("end")));
+  const previousModeRef = useRef<string | null>(null);
+  useEffect(() => {
+    const isGenuineSwitch = previousModeRef.current === "public" && mode === "researcher";
+    if (isGenuineSwitch && !hadCarriedParams.current) {
+      setStartDate("");
+      setEndDate("");
+    }
+    previousModeRef.current = mode;
+  }, [mode]);
+
+  // A carried-over date range only means anything in Researcher mode
+  // (Public mode has no date filter at all) -- switch automatically so
+  // the link actually does what it promises.
+  useEffect(() => {
+    if ((searchParams.get("start") || searchParams.get("end")) && mode === "public") {
+      setMode("researcher");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <main className="page">
+      <header className="header">
+        <p className="eyebrow">DOT On-Time Performance &middot; Carrier Profile</p>
+        <h1 className="title">{carrierName(code)} ({code})</h1>
+        <div className="profile-actions">
+          <Link href="/carriers" className="profile-action-button">&larr; Back to carrier rankings and search</Link>
+          <Link href={`/compare?mode=carrier&carrier=${code}`} className="profile-action-button">Compare {code} with another carrier &rarr;</Link>
+        </div>
+      </header>
+
+      {notFound && <p className="error-text">No flights found for {code} in that range.</p>}
+      {error && <p className="error-text">Could not load this profile &mdash; check the API is running.</p>}
+      {!detail && !notFound && !error && <p className="error-text">Loading...</p>}
+
+      {detail && mode === "public" && (
+        <section className="section">
+          <div className="screen">
+            {profile && (
+              <p className="page-note" style={{ marginBottom: "1rem" }}>
+                Founded {profile.founded} &middot; Headquarters {profile.headquarters}
+                <br />
+                {profile.overview}
+              </p>
+            )}
+
+            <div className="board">
+              <div className="tile">
+                <span className="tile-label">Total flights</span>
+                <span className="tile-value">{detail.total_flights.toLocaleString()}</span>
+              </div>
+              <div className="tile">
+                <span className="tile-label">On-time rate</span>
+                <span className="tile-value">{(detail.on_time_rate * 100).toFixed(1)}%</span>
+              </div>
+              <div className="tile">
+                <span className="tile-label">Avg arrival delay</span>
+                <span className="tile-value rust">
+                  {detail.avg_arrival_delay_minutes != null ? `${detail.avg_arrival_delay_minutes.toFixed(1)} min` : "\u2014"}
+                </span>
+              </div>
+              <div className="tile">
+                <span className="tile-label">Cancellation rate</span>
+                <span className="tile-value rust">{(detail.cancellation_rate * 100).toFixed(2)}%</span>
+              </div>
+            </div>
+
+            {detail.health && (
+              <div style={{ display: "flex", alignItems: "center", gap: "1.5rem", marginTop: "1.5rem" }}>
+                <span style={{ fontFamily: "var(--font-mono), monospace", fontSize: "2.4rem", fontWeight: 700, color: scoreColor(detail.health.score) }}>
+                  {Math.round(detail.health.score)}
+                </span>
+                <p style={{ margin: 0 }}>
+                  Rated <strong style={{ color: scoreColor(detail.health.score) }}>{detail.health.rating}</strong>{" "}
+                  overall{" "}
+                  &mdash; on-time {(detail.on_time_rate * 100).toFixed(0)}% of the time, cancelling {(detail.cancellation_rate * 100).toFixed(1)}% of flights.
+                </p>
+              </div>
+            )}
+
+            <p className="page-note" style={{ marginTop: "1.5rem" }}>
+              Want the full breakdown &mdash; trend over time, delay causes, top routes, schedule
+              padding?
+            </p>
+            <button
+              type="button"
+              className="profile-action-button"
+              style={{ marginTop: "0.6rem" }}
+              onClick={() => setMode("researcher")}
+            >
+              Switch to Researcher mode
+            </button>
+          </div>
+        </section>
+      )}
+
+      {detail && mode === "researcher" && (
+        <>
+          <section className="section">
+            <div className="screen">
+              <DateRangePreset
+                key={mode}
+                startDate={startDate}
+                endDate={endDate}
+                onChange={(start, end) => { setStartDate(start); setEndDate(end); }}
+              />
+            </div>
+          </section>
+
+          <div className="profile-layout">
+            <aside className="profile-facts">
+              {detail.health && (
+                <div className="profile-facts-health">
+                  <span className="profile-facts-score" style={{ color: scoreColor(detail.health.score) }}>
+                    {Math.round(detail.health.score)}
+                  </span>
+                  <span className="tile-value" style={{ color: scoreColor(detail.health.score), fontSize: "0.9rem" }}>
+                    {detail.health.rating}
+                  </span>
+                  <span className="tile-label">Health score</span>
+                </div>
+              )}
+              <dl className="profile-facts-list">
+                {profile && (
+                  <>
+                    <div>
+                      <dt>Founded</dt>
+                      <dd>{profile.founded}</dd>
+                    </div>
+                    <div>
+                      <dt>Headquarters</dt>
+                      <dd>{profile.headquarters}</dd>
+                    </div>
+                  </>
+                )}
+                <div>
+                  <dt>Total flights</dt>
+                  <dd>{detail.total_flights.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt>On-time rate</dt>
+                  <dd>{(detail.on_time_rate * 100).toFixed(1)}%</dd>
+                </div>
+                <div>
+                  <dt>Avg arrival delay</dt>
+                  <dd>{detail.avg_arrival_delay_minutes != null ? `${detail.avg_arrival_delay_minutes.toFixed(1)} min` : "\u2014"}</dd>
+                </div>
+                <div>
+                  <dt>Cancellation rate</dt>
+                  <dd>{(detail.cancellation_rate * 100).toFixed(2)}%</dd>
+                </div>
+              </dl>
+              {profile && (
+                <p className="page-note">
+                  {profile.overview}
+                  {profile.note && (
+                    <>
+                      <br /><br />
+                      <em>{profile.note}</em>
+                    </>
+                  )}
+                </p>
+              )}
+            </aside>
+
+            <div className="profile-content">
+              <div className="sort-toggle" style={{ marginBottom: "1rem" }}>
+                {RESEARCHER_TABS.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    className={tab === t ? "sort-toggle-active" : ""}
+                    onClick={() => setTab(t)}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+
+              {tab === "Health Score" && detail.health && (
+                <section className="section" style={{ marginTop: 0 }}>
+                  <div className="screen">
+                    <HealthBadge health={detail.health} />
+                  </div>
+                </section>
+              )}
+
+              {tab === "Trend" && detail.months?.length > 0 && (
+                <section className="section" style={{ marginTop: 0 }}>
+                  <div className="screen">
+                    <TrendChart data={detail.months} />
+                  </div>
+                </section>
+              )}
+
+              {tab === "Delays & Routes" && (
+                <>
+                  <div className="route-detail-grid" style={{ marginTop: 0 }}>
+                    {detail.causes?.length > 0 && (
+                      <section className="section" style={{ marginTop: 0 }}>
+                        <div className="section-head">
+                          <h2 className="section-title">Delay causes</h2>
+                        </div>
+                        <div className="screen">
+                          <DelayCauseChart data={detail.causes} />
+                        </div>
+                      </section>
+                    )}
+                    {detail.top_airports?.length > 0 && (
+                      <section className="section" style={{ marginTop: 0 }}>
+                        <div className="section-head">
+                          <h2 className="section-title">Busiest airports</h2>
+                        </div>
+                        <div className="screen">
+                          <AirportChart data={detail.top_airports} />
+                        </div>
+                      </section>
+                    )}
+                  </div>
+                  {detail.top_routes?.length > 0 && (
+                    <section className="section">
+                      <div className="section-head">
+                        <h2 className="section-title">Top routes</h2>
+                      </div>
+                      <div className="screen">
+                        <RouteChart data={detail.top_routes} />
+                      </div>
+                    </section>
+                  )}
+                </>
+              )}
+
+              {tab === "Schedule & Codeshare" && (
+                <>
+                  {padding?.periods?.length > 0 && (
+                    <section className="section" style={{ marginTop: 0 }}>
+                      <div className="section-head">
+                        <h2 className="section-title">Does this carrier pad its schedule?</h2>
+                        <span className="sort-toggle">
+                          {(["day", "week", "month", "year"] as const).map((g) => (
+                            <button
+                              key={g}
+                              type="button"
+                              className={paddingGranularity === g ? "sort-toggle-active" : ""}
+                              onClick={() => {
+                                setPaddingGranularity(g);
+                                fetchPadding(g);
+                              }}
+                            >
+                              {g === "day" ? "Daily" : g === "week" ? "Weekly" : g === "month" ? "Monthly" : "Yearly"}
+                            </button>
+                          ))}
+                        </span>
+                      </div>
+                      <div className="screen">
+                        <p className="page-note" style={{ marginBottom: "0.75rem" }}>
+                          &ldquo;On-time&rdquo; is measured against a carrier&apos;s own posted
+                          schedule &mdash; a flight scheduled to take longer than it really needs
+                          has more room to run late and still count as on time. Right now, this
+                          carrier&apos;s flights land in about{" "}
+                          <strong>{Math.abs(padding.avg_padding_minutes).toFixed(1)} minutes {padding.avg_padding_minutes >= 0 ? "less" : "more"}</strong>{" "}
+                          time than scheduled, on average.
+                        </p>
+                        <SchedulePaddingChart data={padding.periods} />
+                      </div>
+                    </section>
+                  )}
+
+                  {codeshare?.groups?.length > 0 && (
+                    <section className="section">
+                      <div className="section-head">
+                        <h2 className="section-title">Who actually flies this carrier&apos;s flights?</h2>
+                      </div>
+                      <div className="screen">
+                        <p className="page-note" style={{ marginBottom: "0.75rem" }}>
+                          {codeshare.groups.length === 1 ? (
+                            <>Every flight in this scope was self-operated &mdash; no codeshare partners found.</>
+                          ) : (
+                            <>
+                              {(codeshare.groups.find((g: any) => g.group === "Codeshare-operated")?.share * 100 || 0).toFixed(1)}%
+                              {" "}of flights in scope were codeshare-operated (flown by a regional partner under this carrier&apos;s code).
+                            </>
+                          )}
+                        </p>
+                        <CodeshareChart data={codeshare.groups} />
+                        {codeshare.top_operating_partners?.length > 0 && (
+                          <div style={{ marginTop: "1.5rem" }}>
+                            <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Top operating partners</p>
+                            <table className="compare-table">
+                              <thead>
+                                <tr><th>Operating carrier code</th><th>Flights</th><th>On-time</th></tr>
+                              </thead>
+                              <tbody>
+                                {codeshare.top_operating_partners.map((p: any) => (
+                                  <tr key={p.operating_airline}>
+                                    <td>{p.operating_airline}</td>
+                                    <td>{p.total_flights.toLocaleString()}</td>
+                                    <td>{(p.on_time_rate * 100).toFixed(1)}%</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    </section>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </main>
+  );
+}
