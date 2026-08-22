@@ -39,6 +39,8 @@ tests/test_predictive_risk_seasonality.py.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -46,6 +48,21 @@ from typing import Any
 import numpy as np
 
 from api.db import open_readonly_connection
+
+# Training the panel model (query + build examples + fit logistic regression
+# + Platt calibration) is the expensive part of a request -- and it's the
+# SAME work regardless of which single entity the caller wants scored, since
+# the panel is "all entities of this type in this date range." Without
+# caching, checking 5 different carriers means 5 full independent retrains
+# of the identical 11-carrier panel. Confirmed this matters on a real
+# resource-constrained deploy: on Render's Starter tier (0.5 vCPU), this
+# endpoint alone took ~24s standalone and intermittently 502'd (Render's own
+# proxy timeout) when it followed other requests in quick succession on the
+# same instance. TTL is short (the warehouse doesn't change within a
+# session, but this isn't meant to serve stale data indefinitely either).
+_PANEL_CACHE: dict[tuple, tuple[float, dict]] = {}
+_PANEL_CACHE_LOCK = threading.Lock()
+PANEL_CACHE_TTL_SECONDS = 600
 
 FEATURE_NAMES = (
     "severe_delay_rate",
@@ -429,6 +446,57 @@ def _query_monthly_entity_rows(
     return [dict(zip(keys, row)) for row in rows]
 
 
+def _train_panel(
+    *, entity_type: str, start_date: str, end_date: str, minimum_flights: int, risk_quantile: float
+) -> dict[str, Any]:
+    """The expensive, entity-independent part of get_predictive_operational_risk
+    (query + build examples + fit + calibrate) -- cached by its own
+    parameters so scoring a different entity against the SAME panel doesn't
+    redo it. Returns a dict with an "error" key on failure, same convention
+    as the public function, so callers don't need a separate exception path."""
+    key = (entity_type, start_date, end_date, minimum_flights, risk_quantile)
+    now = time.monotonic()
+    with _PANEL_CACHE_LOCK:
+        cached = _PANEL_CACHE.get(key)
+        if cached is not None and now - cached[0] < PANEL_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    rows = _query_monthly_entity_rows(
+        start_date=start_date, end_date=end_date, entity_type=entity_type, minimum_flights=minimum_flights
+    )
+    if not rows:
+        result = {"error": "No monthly data matched that filter."}
+        with _PANEL_CACHE_LOCK:
+            _PANEL_CACHE[key] = (now, result)
+        return result
+
+    examples, risk_threshold, train_end = build_supervised_examples(rows, risk_quantile=risk_quantile)
+    if len(examples) < 12:
+        result = {"error": f"Only {len(examples)} entity-month examples available -- need more history to train and evaluate honestly."}
+        with _PANEL_CACHE_LOCK:
+            _PANEL_CACHE[key] = (now, result)
+        return result
+
+    # validation_end only carves up the EVALUATION split -- train_end came
+    # back from build_supervised_examples, which already used it to decide
+    # which examples' outcomes were allowed to inform the risk threshold.
+    periods = sorted({row["target_period"] for row in examples})
+    validation_end = periods[int(len(periods) * 0.8)]
+
+    try:
+        fit = train_temporal_risk_model(examples, train_end=train_end, validation_end=validation_end)
+    except ValueError as exc:
+        result = {"error": str(exc)}
+        with _PANEL_CACHE_LOCK:
+            _PANEL_CACHE[key] = (now, result)
+        return result
+
+    result = {"rows": rows, "fit": fit, "risk_threshold": risk_threshold}
+    with _PANEL_CACHE_LOCK:
+        _PANEL_CACHE[key] = (now, result)
+    return result
+
+
 def get_predictive_operational_risk(
     *,
     entity_type: str,
@@ -443,27 +511,17 @@ def get_predictive_operational_risk(
     since a single entity's own month-to-month series alone is nowhere
     near enough examples to fit or evaluate a model honestly. The
     requested entity's most recent period is then scored with that
-    network-trained model."""
-    rows = _query_monthly_entity_rows(
-        start_date=start_date, end_date=end_date, entity_type=entity_type, minimum_flights=minimum_flights
+    network-trained model. The panel itself is cached (see _train_panel)
+    since it's identical across different entities of the same type/range."""
+    panel = _train_panel(
+        entity_type=entity_type, start_date=start_date, end_date=end_date,
+        minimum_flights=minimum_flights, risk_quantile=risk_quantile,
     )
-    if not rows:
-        return {"error": "No monthly data matched that filter."}
-
-    examples, risk_threshold, train_end = build_supervised_examples(rows, risk_quantile=risk_quantile)
-    if len(examples) < 12:
-        return {"error": f"Only {len(examples)} entity-month examples available -- need more history to train and evaluate honestly."}
-
-    # validation_end only carves up the EVALUATION split -- train_end came
-    # back from build_supervised_examples, which already used it to decide
-    # which examples' outcomes were allowed to inform the risk threshold.
-    periods = sorted({row["target_period"] for row in examples})
-    validation_end = periods[int(len(periods) * 0.8)]
-
-    try:
-        fit = train_temporal_risk_model(examples, train_end=train_end, validation_end=validation_end)
-    except ValueError as exc:
-        return {"error": str(exc)}
+    if "error" in panel:
+        return panel
+    rows = panel["rows"]
+    fit = panel["fit"]
+    risk_threshold = panel["risk_threshold"]
 
     entity = entity.upper()
     entity_rows = [row for row in rows if str(row["entity"]).upper() == entity]
