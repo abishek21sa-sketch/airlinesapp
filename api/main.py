@@ -23,6 +23,7 @@ from api.db import database_path, open_readonly_connection
 from config import PIPELINE_STATE_FILE
 from api import predictive_risk
 from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELECT_EXPRS
+from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
 from api.queue_pressure import get_queue_pressure
 from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
@@ -2002,6 +2003,31 @@ def delay_propagation_endpoint(
             {"label": f"Loose (>{TARGET_TURNAROUND_MINUTES} min)", "pairs": pairs_loose, "correlation": corr_loose},
         ],
     }
+
+
+@app.get("/api/delay-propagation-markov")
+def delay_propagation_markov_endpoint(
+    carrier: Optional[str] = Query(None),
+    start_state: str = Query("severe", description=f"One of {list(MARKOV_STATES)}"),
+    forecast_steps: int = Query(3, ge=1, le=6, description="How many legs ahead to forecast (matrix power)"),
+    turnaround_bucket: str = Query("normal", description="'tight', 'normal', or 'loose' -- applied uniformly across all forecasted legs"),
+):
+    """Additive to /api/delay-propagation, NOT a replacement for it -- that
+    endpoint's correlation view is still a fine one-step association
+    summary. This answers a genuinely different question a single
+    correlation coefficient can't: multi-step forecasts like "given this
+    flight lands severely delayed, what's the probability the aircraft is
+    STILL delayed two legs later," via a real empirical Markov chain and
+    matrix powers, not an approximation. See
+    api/delay_propagation_markov.py for the full methodology and
+    tests/test_delay_propagation_markov.py for verification against
+    hand-computed toy examples."""
+    result = get_delay_propagation_markov(
+        carrier=carrier, start_state=start_state, forecast_steps=forecast_steps, turnaround_bucket=turnaround_bucket,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.get("/api/decision/propagation-scenario")

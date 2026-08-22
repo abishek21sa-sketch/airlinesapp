@@ -38,6 +38,8 @@ ENDPOINTS = [
     ("/api/decision/departure-bank-smoothing?airport=ORD", "Departure bank smoothing (ORD, defaults)"),
     ("/api/decision/network-protection-portfolio", "Network protection portfolio (default carrier/budget)"),
     ("/api/decision/predictive-risk?entity_type=carrier&entity=WN", "Predictive risk screen (Southwest)"),
+    ("/api/queue-pressure?airport=ORD", "Queue pressure incl. M/G/c queueing model (ORD, defaults)"),
+    ("/api/delay-propagation-markov?carrier=WN", "Markov-chain delay propagation (Southwest, defaults)"),
 ]
 
 
