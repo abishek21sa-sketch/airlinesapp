@@ -40,6 +40,7 @@ ENDPOINTS = [
     ("/api/decision/predictive-risk?entity_type=carrier&entity=WN", "Predictive risk screen (Southwest)"),
     ("/api/queue-pressure?airport=ORD", "Queue pressure incl. M/G/c queueing model (ORD, defaults)"),
     ("/api/delay-propagation-markov?carrier=WN", "Markov-chain delay propagation (Southwest, defaults)"),
+    ("/api/decision/network-resilience", "Network resilience ranking (route graph centrality, defaults)"),
 ]
 
 

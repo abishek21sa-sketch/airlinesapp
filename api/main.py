@@ -24,6 +24,7 @@ from config import PIPELINE_STATE_FILE
 from api import predictive_risk
 from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELECT_EXPRS
 from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
+from api.network_graph import compute_network_resilience
 from api.queue_pressure import get_queue_pressure
 from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
@@ -347,6 +348,30 @@ def network_protection_portfolio_endpoint(
         "residual_exposure": result.residual_exposure,
         "methodology": result.methodology,
     }
+
+
+@app.get("/api/decision/network-resilience")
+def network_resilience_endpoint(
+    minimum_flights: int = Query(50, ge=1, description="Routes below this total-flight floor are excluded from the graph entirely"),
+    top_n: int = Query(15, ge=1, le=50),
+):
+    """OR Feature: which airports are structural bridges in the route
+    network, vs. which are just high-volume hubs -- a genuinely new
+    capability (this project had zero graph modeling anywhere before this).
+    Builds a real directed graph (airports as nodes, routes as edges) from
+    the whole network and reports degree centrality (raw connection count
+    and traffic volume) and betweenness centrality (fraction of shortest
+    paths between OTHER airport pairs passing through this one) SEPARATELY
+    -- never blended into one score, matching this project's own Health
+    Score / Network Protection Portfolio discipline. Betweenness in
+    particular can surface airports that matter structurally despite modest
+    traffic volume -- see api/network_graph.py for the full methodology and
+    tests/test_network_graph.py for verification against synthetic graphs
+    with a mathematically known correct answer."""
+    result = compute_network_resilience(minimum_flights=minimum_flights, top_n=top_n)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @app.get("/api/decision/predictive-risk")

@@ -96,6 +96,15 @@ type Coefficient = {
   direction: "higher_risk" | "lower_risk";
 };
 
+type CentralityEntry = { airport: string; value: number };
+
+type NetworkResilienceResult = {
+  scope: { minimum_flights_per_route: number; airport_count: number; route_count: number };
+  degree_centrality: { top_by_route_count: CentralityEntry[]; top_by_flight_volume: CentralityEntry[] };
+  betweenness_centrality: { top_structural_bridges: CentralityEntry[] };
+  methodology: { combination_policy: string; limitations: string[] };
+};
+
 type RiskResult = {
   entity_type: string;
   entity: string;
@@ -180,7 +189,7 @@ function deriveRankingVerdict(result: RankingResult): string | null {
 }
 
 export default function DecisionCenterPage() {
-  const [tab, setTab] = useState<"levers" | "scenario" | "ranking" | "risk" | "bank" | "portfolio">("levers");
+  const [tab, setTab] = useState<"levers" | "scenario" | "ranking" | "risk" | "bank" | "portfolio" | "resilience">("levers");
   const [carrierInput, setCarrierInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [notFound, setNotFound] = useState(false);
@@ -210,6 +219,9 @@ export default function DecisionCenterPage() {
   const [portfolioMetric, setPortfolioMetric] = useState("severe_delay_exposure");
   const [portfolioResult, setPortfolioResult] = useState<any>(null);
 
+  const [resilienceMinFlights, setResilienceMinFlights] = useState(50);
+  const [resilienceResult, setResilienceResult] = useState<NetworkResilienceResult | null>(null);
+
   useEffect(() => {
     if ((riskEntityType === "airport" || tab === "bank") && airportOptions.length === 0) {
       fetch(`${API_BASE}/api/airports/list`)
@@ -226,6 +238,7 @@ export default function DecisionCenterPage() {
     setRiskResult(null);
     setBankResult(null);
     setPortfolioResult(null);
+    setResilienceResult(null);
     setNotFound(false);
     setError(false);
   }
@@ -276,6 +289,10 @@ export default function DecisionCenterPage() {
         const res = await fetch(`${API_BASE}/api/decision/network-protection-portfolio?${params}`);
         if (!res.ok) throw new Error("not ok");
         setPortfolioResult(await res.json());
+      } else if (tab === "resilience") {
+        const res = await fetch(`${API_BASE}/api/decision/network-resilience?minimum_flights=${resilienceMinFlights}`);
+        if (!res.ok) throw new Error("not ok");
+        setResilienceResult(await res.json());
       } else {
         const res = await fetch(`${API_BASE}/api/decision/opportunity-ranking`);
         if (!res.ok) throw new Error("not ok");
@@ -349,6 +366,13 @@ export default function DecisionCenterPage() {
           onClick={() => { setTab("portfolio"); resetResults(); }}
         >
           Network Protection Portfolio
+        </button>
+        <button
+          type="button"
+          className={tab === "resilience" ? "sort-toggle-active" : ""}
+          onClick={() => { setTab("resilience"); resetResults(); }}
+        >
+          Network Resilience Ranking
         </button>
       </div>
 
@@ -461,6 +485,26 @@ export default function DecisionCenterPage() {
                 <strong>What this is not:</strong> a claim that intervening will produce a
                 specific improvement &mdash; it's an allocation tool over real, disclosed
                 historical metrics, not a causal guarantee.
+              </p>
+            </>
+          )}
+
+          {tab === "resilience" && (
+            <>
+              <p className="page-note" style={{ marginBottom: "1rem" }}>
+                <strong>What this is:</strong> a real directed graph &mdash; airports as nodes,
+                routes as edges &mdash; built from the whole network, not just the busiest routes.
+                Reports two genuinely different, separately-computed measures: raw hub-ness
+                (connection count and traffic volume) and betweenness centrality (what fraction of
+                shortest paths between OTHER airport pairs run through this one). An airport can
+                rank low on volume but high on betweenness if it's a structural bridge with few
+                alternate routes around it &mdash; that's the actual point of computing it
+                separately rather than folding it into one score.
+              </p>
+              <p className="page-note" style={{ marginBottom: "1rem" }}>
+                <strong>What this is not:</strong> a simulation of what actually happens to the
+                network if an airport closes &mdash; betweenness is a structural proxy, not a
+                literal removal-and-resimulate model.
               </p>
             </>
           )}
@@ -625,6 +669,22 @@ export default function DecisionCenterPage() {
               </label>
               <button type="button" className="compare-run" onClick={analyze} disabled={loading}>
                 {loading ? "Solving..." : "Build portfolio"}
+              </button>
+            </div>
+          )}
+
+          {tab === "resilience" && (
+            <div className="route-lookup-row">
+              <label className="filter-field">
+                <span className="filter-label">Minimum flights per route</span>
+                <input
+                  type="number" min={1} max={5000} value={resilienceMinFlights}
+                  onChange={(e) => setResilienceMinFlights(Number(e.target.value))}
+                  style={{ width: "6rem" }}
+                />
+              </label>
+              <button type="button" className="compare-run" onClick={analyze} disabled={loading}>
+                {loading ? "Computing..." : "Rank network"}
               </button>
             </div>
           )}
@@ -1119,6 +1179,59 @@ export default function DecisionCenterPage() {
             )}
 
             <p className="page-note" style={{ marginTop: "1rem" }}>{portfolioResult.methodology.combination_policy}</p>
+          </div>
+        </section>
+      )}
+
+      {tab === "resilience" && resilienceResult && (
+        <section className="section">
+          <div className="screen">
+            <div className="board board-compact">
+              <Tile label="Airports in graph" value={String(resilienceResult.scope.airport_count)} />
+              <Tile label="Routes in graph" value={String(resilienceResult.scope.route_count)} />
+              <Tile label="Min flights/route" value={String(resilienceResult.scope.minimum_flights_per_route)} />
+            </div>
+
+            <div style={{ marginTop: "1.5rem" }}>
+              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
+                Top structural bridges (betweenness centrality)
+              </p>
+              <table className="compare-table">
+                <thead><tr><th>Airport</th><th>Betweenness</th></tr></thead>
+                <tbody>
+                  {resilienceResult.betweenness_centrality.top_structural_bridges.map((e) => (
+                    <tr key={e.airport}><td>{e.airport}</td><td>{e.value}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ marginTop: "1.5rem", display: "flex", gap: "2rem", flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 300px" }}>
+                <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Top by route count</p>
+                <table className="compare-table">
+                  <thead><tr><th>Airport</th><th>Routes</th></tr></thead>
+                  <tbody>
+                    {resilienceResult.degree_centrality.top_by_route_count.map((e) => (
+                      <tr key={e.airport}><td>{e.airport}</td><td>{e.value}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ flex: "1 1 300px" }}>
+                <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Top by flight volume</p>
+                <table className="compare-table">
+                  <thead><tr><th>Airport</th><th>Flights</th></tr></thead>
+                  <tbody>
+                    {resilienceResult.degree_centrality.top_by_flight_volume.map((e) => (
+                      <tr key={e.airport}><td>{e.airport}</td><td>{e.value.toLocaleString()}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <p className="page-note" style={{ marginTop: "1rem" }}>{resilienceResult.methodology.combination_policy}</p>
           </div>
         </section>
       )}
