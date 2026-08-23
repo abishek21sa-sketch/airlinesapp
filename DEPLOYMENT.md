@@ -1,5 +1,22 @@
 # Deployment Guide
 
+**Current status: not hosted.** This project previously ran on Render
+(backend) + Vercel (frontend); that backend service has been shut down to
+stop the recurring cost. Running it locally (see [README.md](README.md) for
+building the data warehouse from scratch, then [TESTING_GUIDE.md](TESTING_GUIDE.md)
+for backend/frontend setup) is the supported path now.
+
+The rest of this file is kept as a reference for anyone who wants to
+self-host their own copy on Render or Railway -- it worked, and the steps
+below are accurate -- but read the real, disclosed limitation in
+[CLAUDE.md](CLAUDE.md)'s "Known constraint" note first: on Render's
+cheapest disk-capable tier (Standard, 2GB RAM), several data-heavy Decision
+Center endpoints hit in sequence within one warm process can exhaust memory
+and crash it. Fine for solo/light use, not verified stable under real
+concurrent traffic. Paid tiers with more RAM likely fix it but cost more --
+this is exactly the tradeoff that made self-hosting not worth it for this
+project's own budget.
+
 Three separate pieces, deployed separately: **frontend** (Vercel), **backend
 API** (Render or Railway), and the **automated data pipeline** (stays local,
 deliberately -- see below).
@@ -36,7 +53,7 @@ network access to actually run `next build`.
 
 ---
 
-## 1. Backend API -- Render (recommended starting point)
+## 1. Backend API -- Render (optional, if you choose to self-host)
 
 Render is the easier first deployment if you have no hosting experience --
 straightforward Docker support, good docs. NOT actually free for this app
