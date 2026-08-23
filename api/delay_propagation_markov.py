@@ -46,11 +46,14 @@ multi-step helper does not do automatically.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
 
 from api.db import open_readonly_connection
+
+DEFAULT_LOOKBACK_DAYS = 365
 
 STATES = ("on_time", "minor", "moderate", "severe")
 STATE_INDEX = {name: i for i, name in enumerate(STATES)}
@@ -70,9 +73,12 @@ def _state_case_sql(column: str) -> str:
     )
 
 
-def _query_transition_counts(carrier: str | None) -> list[dict]:
-    clauses = ["Cancelled = 0", "Diverted = 0", "Tail_Number IS NOT NULL", "Tail_Number != ''"]
-    params: list[Any] = []
+def _query_transition_counts(carrier: str | None, start_date: str, end_date: str) -> list[dict]:
+    clauses = [
+        "FlightDate BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
+        "Cancelled = 0", "Diverted = 0", "Tail_Number IS NOT NULL", "Tail_Number != ''",
+    ]
+    params: list[Any] = [start_date, end_date]
     if carrier:
         clauses.append("Marketing_Airline_Network = ?")
         params.append(carrier.upper())
@@ -182,7 +188,13 @@ def multi_step_distribution(matrix: np.ndarray, start_state: str, n_steps: int) 
 
 
 def get_delay_propagation_markov(
-    *, carrier: str | None = None, start_state: str = "severe", forecast_steps: int = 3, turnaround_bucket: str = "normal",
+    *,
+    carrier: str | None = None,
+    start_state: str = "severe",
+    forecast_steps: int = 3,
+    turnaround_bucket: str = "normal",
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     if start_state not in STATES:
         return {"error": f"start_state must be one of {STATES}"}
@@ -191,7 +203,20 @@ def get_delay_propagation_markov(
     if forecast_steps < 1 or forecast_steps > 6:
         return {"error": "forecast_steps must be between 1 and 6"}
 
-    counts = _query_transition_counts(carrier)
+    # No date scoping here at all used to mean this ran LAG/LEAD window
+    # functions over the FULL unscoped ~59M-row history on every call --
+    # confirmed via real production testing this crashed the deployed
+    # backend outright (same root cause as the pre-existing
+    # /api/delay-propagation, which had the identical gap -- see its
+    # docstring in api/main.py for the full incident). Defaulting to a
+    # trailing-12-month window here too, same fix, same reasoning.
+    if not start_date or not end_date:
+        with open_readonly_connection() as connection:
+            max_date = connection.execute("SELECT MAX(FlightDate) FROM flights").fetchone()[0]
+        end_date = end_date or str(max_date)
+        start_date = start_date or str(date.fromisoformat(str(max_date)) - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+
+    counts = _query_transition_counts(carrier, start_date, end_date)
     if not counts:
         return {"error": "No same-day multi-leg rotations matched that filter."}
 
@@ -205,6 +230,7 @@ def get_delay_propagation_markov(
 
     return {
         "carrier": carrier.upper() if carrier else None,
+        "date_range": f"{start_date} to {end_date}",
         "start_state": start_state,
         "turnaround_bucket": turnaround_bucket,
         "forecast_steps": forecast_steps,

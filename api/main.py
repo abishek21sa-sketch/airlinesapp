@@ -1898,8 +1898,26 @@ TARGET_TURNAROUND_MINUTES = 45
 @app.get("/api/delay-propagation")
 def delay_propagation_endpoint(
     carrier: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None, description="Defaults to the trailing 12 months of available data"),
+    end_date: Optional[str] = Query(None),
 ):
     """Does a late-arriving aircraft's delay carry over to its next flight?
+
+    IMPORTANT operational note, found via real production testing: this
+    endpoint (and /api/delay-propagation-markov, which reuses the same
+    sequencing pattern) run LAG/LEAD window functions over Tail_Number,
+    FlightDate. Confirmed this endpoint had NO date scoping at all before
+    this fix -- it ran over the FULL 59M-row unscoped history on every
+    call, including the automatic, unconditional call the Aircraft page
+    fires on every page load. That crashed the deployed backend outright
+    (confirmed live against production: /api/health itself started
+    returning 502 immediately after hitting this endpoint, on a fresh
+    request with no prior load). start_date/end_date now default to a
+    trailing 12-month window (~7.6M rows, ~7.8x fewer than unscoped) --
+    still a real, substantial sample, just no longer processing 8 years
+    of history by default. Passing an explicit wider range is still
+    possible and this project's disclosure obligation doesn't disappear:
+    the scope actually used is reported in the response.
     Sequences each tail's flights within a calendar day by SCHEDULED
     departure time (CRSDepTime, not actual -- ordering by an outcome-
     dependent actual time would risk the same kind of self-referential
@@ -1931,8 +1949,17 @@ def delay_propagation_endpoint(
     page -- BTS's own delay-cause coding is an independent (differently-
     defined, but related) source for the same phenomenon. Optionally
     filtered by marketing carrier."""
-    clauses = ["Cancelled = 0", "Diverted = 0", "Tail_Number IS NOT NULL", "Tail_Number != ''"]
-    params: list = []
+    if not start_date or not end_date:
+        with open_readonly_connection() as connection:
+            max_date = connection.execute("SELECT MAX(FlightDate) FROM flights").fetchone()[0]
+        end_date = end_date or str(max_date)
+        start_date = start_date or str(date.fromisoformat(str(max_date)) - timedelta(days=365))
+
+    clauses = [
+        "FlightDate BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
+        "Cancelled = 0", "Diverted = 0", "Tail_Number IS NOT NULL", "Tail_Number != ''",
+    ]
+    params: list = [start_date, end_date]
     if carrier:
         clauses.append("Marketing_Airline_Network = ?")
         params.append(carrier.upper())
@@ -2017,6 +2044,7 @@ def delay_propagation_endpoint(
     ) = row
 
     return {
+        "date_range": f"{start_date} to {end_date}",
         "pairs": pairs,
         "correlation": correlation,
         "avg_dep_delay_predecessor_on_time": avg_on_time,
@@ -2036,6 +2064,8 @@ def delay_propagation_markov_endpoint(
     start_state: str = Query("severe", description=f"One of {list(MARKOV_STATES)}"),
     forecast_steps: int = Query(3, ge=1, le=6, description="How many legs ahead to forecast (matrix power)"),
     turnaround_bucket: str = Query("normal", description="'tight', 'normal', or 'loose' -- applied uniformly across all forecasted legs"),
+    start_date: Optional[str] = Query(None, description="Defaults to the trailing 12 months of available data"),
+    end_date: Optional[str] = Query(None),
 ):
     """Additive to /api/delay-propagation, NOT a replacement for it -- that
     endpoint's correlation view is still a fine one-step association
@@ -2046,9 +2076,16 @@ def delay_propagation_markov_endpoint(
     matrix powers, not an approximation. See
     api/delay_propagation_markov.py for the full methodology and
     tests/test_delay_propagation_markov.py for verification against
-    hand-computed toy examples."""
+    hand-computed toy examples.
+
+    start_date/end_date default to a trailing 12-month window -- found via
+    real production testing that no date scoping at all (the original
+    version of this endpoint, and the pre-existing /api/delay-propagation
+    it's additive to) crashed the deployed backend outright by running
+    window functions over the full ~59M-row unscoped history."""
     result = get_delay_propagation_markov(
         carrier=carrier, start_state=start_state, forecast_steps=forecast_steps, turnaround_bucket=turnaround_bucket,
+        start_date=start_date, end_date=end_date,
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
