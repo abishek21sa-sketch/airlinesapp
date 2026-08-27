@@ -26,6 +26,7 @@ from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELE
 from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
 from api.network_graph import compute_network_resilience
 from api.queue_pressure import get_queue_pressure
+from api.schedule_padding_trend import get_schedule_padding_trend
 from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
 from api.optimization.network_protection import InterventionCandidate, solve_portfolio
@@ -2977,6 +2978,7 @@ def schedule_padding_endpoint(
             }
             for r in period_rows
         ],
+        "trend_analysis": get_schedule_padding_trend(where, params),
     }
 
 

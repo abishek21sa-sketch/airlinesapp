@@ -412,6 +412,55 @@ function CarrierProfilePageInner() {
                           time than scheduled, on average.
                         </p>
                         <SchedulePaddingChart data={padding.periods} />
+
+                        {padding.trend_analysis && !padding.trend_analysis.error && (
+                          <>
+                            <p className="page-note" style={{ marginTop: "1rem", marginBottom: "0.75rem" }}>
+                              Is that trend real, or just noise? A linear regression of every
+                              individual matched flight&apos;s padding against its date says the
+                              trend is{" "}
+                              <strong>
+                                {padding.trend_analysis.significant_at_0_05
+                                  ? "statistically distinguishable from zero"
+                                  : "not statistically distinguishable from zero"}
+                              </strong>
+                              {padding.trend_analysis.significant_at_0_05 && padding.trend_analysis.r_squared < 0.01 && (
+                                <> &mdash; though with r² of {padding.trend_analysis.r_squared.toFixed(4)}, date barely
+                                explains any of the flight-to-flight variation here. On tens of
+                                millions of flights, almost any nonzero trend clears the
+                                significance bar; check the size of the effect, not just whether
+                                it&apos;s &ldquo;significant.&rdquo;</>
+                              )}
+                              .
+                            </p>
+                            <div className="board">
+                              <div className="tile">
+                                <span className="tile-label">Trend</span>
+                                <span className="tile-value">
+                                  {padding.trend_analysis.slope_minutes_per_year > 0 ? "+" : ""}
+                                  {padding.trend_analysis.slope_minutes_per_year.toFixed(2)} min/yr
+                                </span>
+                              </div>
+                              <div className="tile">
+                                <span className="tile-label">95% CI</span>
+                                <span className="tile-value" style={{ fontSize: "0.9rem" }}>
+                                  [{padding.trend_analysis.slope_ci_95_minutes_per_year[0].toFixed(2)},{" "}
+                                  {padding.trend_analysis.slope_ci_95_minutes_per_year[1].toFixed(2)}]
+                                </span>
+                              </div>
+                              <div className="tile">
+                                <span className="tile-label">p-value</span>
+                                <span className="tile-value">
+                                  {padding.trend_analysis.p_value < 0.0001 ? "< 0.0001" : padding.trend_analysis.p_value.toFixed(4)}
+                                </span>
+                              </div>
+                              <div className="tile">
+                                <span className="tile-label">r²</span>
+                                <span className="tile-value">{padding.trend_analysis.r_squared.toFixed(4)}</span>
+                              </div>
+                            </div>
+                          </>
+                        )}
                       </div>
                     </section>
                   )}
