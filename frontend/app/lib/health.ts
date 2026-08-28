@@ -11,6 +11,8 @@
 export type Health = {
   score: number;
   rating: string;
+  standard_error: number;
+  confidence_interval_95: [number, number];
   sample: {
     total_flights: number;
     completed_flights: number;
@@ -18,6 +20,13 @@ export type Health = {
     status: string;
   };
   component_scores: {
+    reliability: number;
+    delay_severity: number;
+    severe_delay_exposure: number;
+    cancellation_resilience: number;
+    diversion_resilience: number;
+  };
+  component_standard_errors: {
     reliability: number;
     delay_severity: number;
     severe_delay_exposure: number;

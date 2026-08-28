@@ -41,6 +41,14 @@ export default function HealthBadge({ health }: { health: Health | null }) {
         <div>
           <p className="eyebrow" style={{ marginBottom: "0.2rem" }}>Health score</p>
           <p className="health-rating" style={{ color }}>{health.rating}</p>
+          {health.confidence_interval_95 && (
+            <p className="health-sample-note">
+              95% confidence interval: {health.confidence_interval_95[0].toFixed(1)}
+              {"–"}
+              {health.confidence_interval_95[1].toFixed(1)}
+              {" "}({health.sample.total_flights.toLocaleString()} flights)
+            </p>
+          )}
           {health.sample.status === "limited" && (
             <p className="health-sample-note">
               Small sample ({health.sample.total_flights.toLocaleString()} flights, under {health.sample.minimum_for_full_confidence}) &mdash; interpret with caution.
@@ -116,6 +124,15 @@ export default function HealthBadge({ health }: { health: Health | null }) {
           <p>
             None of these correlations are close to 1.0 &mdash; past performance is a real
             signal, not a guarantee. Routes, airports, and carriers do change over time.
+          </p>
+          <p>
+            <strong>The 95% confidence interval:</strong> every component above is a sample
+            mean or proportion over a finite number of flights, so it carries real sampling
+            uncertainty &mdash; computed from each component&apos;s actual variance in this
+            data, not assumed. On a whole carrier ({health.sample.total_flights.toLocaleString()}{" "}
+            flights here), that interval is usually tight enough to ignore. On a single route,
+            a single day, or any other small slice, it can span several points &mdash; check it
+            before treating a small gap between two scores as a real difference.
           </p>
           <p>
             Rating bands: 90+ Excellent, 80+ Strong, 70+ Watch, 60+ Weak, under 60 Critical.

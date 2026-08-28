@@ -22,15 +22,35 @@ Weighted (calibrated against future on-time rate, n=6,133 routes):
   diversion_resilience     0.059  (r=+0.119)
 
 Rating bands: >=90 Excellent, >=80 Strong, >=70 Watch, >=60 Weak, else Critical.
+
+Uncertainty quantification (standard_error / confidence_interval_95), added
+alongside the point score, not replacing it: every component is a sample
+mean or sample proportion over a finite number of flights, so it has a real
+standard error, computed via the standard "SE of a sample mean" formula
+(sqrt(variance / n)) using variances DuckDB computes directly via VAR_POP,
+propagated through each component's known linear transform (e.g.
+delay_score = 100 - 2*avg_delay, so SE(delay_score) = 2*SE(avg_delay)).
+The overall score's SE combines the five components' SEs assuming they're
+independent (Var(sum of weighted components) = sum of weight^2 * Var), which
+is a disclosed simplification -- the components are computed from the same
+flights and aren't strictly independent (e.g. a cancelled flight can't also
+be severely delayed), but this is the same assumption behind any quick
+composite-score error-propagation estimate, and errs conservative in
+practice since cancellation/diversion (the most correlated-by-construction
+components with the others) carry small weights. Good enough to answer
+"is an 82 meaningfully different from an 80," not a rigorous joint model.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from scipy import stats as scipy_stats
+
 from api.db import open_readonly_connection
 
 MINIMUM_FLIGHTS_FOR_FULL_CONFIDENCE = 30
+Z_95 = scipy_stats.norm.ppf(0.975)
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
@@ -60,13 +80,26 @@ RAW_STAT_SELECT_EXPRS = """
     COUNT(*) AS total_flights,
     SUM(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN 1 ELSE 0 END) AS completed_flights,
     AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN ArrDelay END) AS avg_arrival_delay,
+    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN ArrDelay END) AS var_arrival_delay,
     AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
         THEN CASE WHEN ArrDelay <= 15 THEN 1.0 ELSE 0.0 END END) * 100 AS on_time_percentage,
+    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
+        THEN CASE WHEN ArrDelay <= 15 THEN 1.0 ELSE 0.0 END END) AS var_on_time_indicator,
     AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
         THEN CASE WHEN ArrDelay > 60 THEN 1.0 ELSE 0.0 END END) * 100 AS severe_delay_percentage,
+    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
+        THEN CASE WHEN ArrDelay > 60 THEN 1.0 ELSE 0.0 END END) AS var_severe_indicator,
     AVG(Cancelled) * 100 AS cancellation_percentage,
-    AVG(Diverted) * 100 AS diversion_percentage
+    VAR_POP(CAST(Cancelled AS DOUBLE)) AS var_cancelled_indicator,
+    AVG(Diverted) * 100 AS diversion_percentage,
+    VAR_POP(CAST(Diverted AS DOUBLE)) AS var_diverted_indicator
 """
+
+
+def _standard_error(variance: float | None, n: int) -> float:
+    if not variance or n <= 0:
+        return 0.0
+    return (max(variance, 0.0) / n) ** 0.5
 
 
 def score_from_row(row: tuple) -> dict | None:
@@ -80,10 +113,15 @@ def score_from_row(row: tuple) -> dict | None:
 
     completed_flights = int(row[1] or 0)
     avg_arrival_delay = float(row[2] or 0)
-    on_time_percentage = float(row[3] or 0)
-    severe_delay_percentage = float(row[4] or 0)
-    cancellation_percentage = float(row[5] or 0)
-    diversion_percentage = float(row[6] or 0)
+    var_arrival_delay = row[3]
+    on_time_percentage = float(row[4] or 0)
+    var_on_time_indicator = row[5]
+    severe_delay_percentage = float(row[6] or 0)
+    var_severe_indicator = row[7]
+    cancellation_percentage = float(row[8] or 0)
+    var_cancelled_indicator = row[9]
+    diversion_percentage = float(row[10] or 0)
+    var_diverted_indicator = row[11]
 
     reliability_score = _clamp(on_time_percentage)
     delay_score = _clamp(100 - max(avg_arrival_delay, 0) * 2)
@@ -100,9 +138,30 @@ def score_from_row(row: tuple) -> dict | None:
         2,
     )
 
+    # Standard error of each component, propagated from the standard error
+    # of the underlying sample mean/proportion through that component's
+    # known linear transform -- see module docstring for the full method
+    # and its independence-assumption caveat on the combined figure.
+    se_reliability = 100 * _standard_error(var_on_time_indicator, completed_flights)
+    se_delay = 2 * _standard_error(var_arrival_delay, completed_flights)
+    se_severe_delay = 5 * 100 * _standard_error(var_severe_indicator, completed_flights)
+    se_cancellation = 10 * 100 * _standard_error(var_cancelled_indicator, total_flights)
+    se_diversion = 20 * 100 * _standard_error(var_diverted_indicator, total_flights)
+
+    se_health_score = (
+        (0.290 * se_reliability) ** 2
+        + (0.251 * se_delay) ** 2
+        + (0.275 * se_severe_delay) ** 2
+        + (0.125 * se_cancellation) ** 2
+        + (0.059 * se_diversion) ** 2
+    ) ** 0.5
+    margin = round(Z_95 * se_health_score, 2)
+
     return {
         "score": health_score,
         "rating": _get_rating(health_score),
+        "standard_error": round(se_health_score, 4),
+        "confidence_interval_95": [round(health_score - margin, 2), round(health_score + margin, 2)],
         "sample": {
             "total_flights": total_flights,
             "completed_flights": completed_flights,
@@ -115,6 +174,13 @@ def score_from_row(row: tuple) -> dict | None:
             "severe_delay_exposure": round(severe_delay_score, 2),
             "cancellation_resilience": round(cancellation_score, 2),
             "diversion_resilience": round(diversion_score, 2),
+        },
+        "component_standard_errors": {
+            "reliability": round(se_reliability, 4),
+            "delay_severity": round(se_delay, 4),
+            "severe_delay_exposure": round(se_severe_delay, 4),
+            "cancellation_resilience": round(se_cancellation, 4),
+            "diversion_resilience": round(se_diversion, 4),
         },
         "weights": {
             "reliability": 0.290,
@@ -150,3 +216,29 @@ def compute_health_score(where_clause: str, params: list[Any]) -> dict | None:
     with open_readonly_connection() as connection:
         row = connection.execute(query, params).fetchone()
     return score_from_row(row)
+
+
+def compare_health_scores(score_a: dict, score_b: dict) -> dict:
+    """Two-sample z-test on the difference between two already-computed
+    health scores (each a score_from_row/compute_health_score result, so
+    each carries its own standard_error). Answers the question a bare
+    "82 vs 80" comparison can't: is that gap distinguishable from the
+    noise in each score's own sample, or small enough that either entity
+    could easily be the "better" one on a different slice of the same
+    data. Valid as long as the two scores come from non-overlapping flight
+    samples (true for any two different carriers/airports/routes)."""
+    diff = round(score_a["score"] - score_b["score"], 2)
+    se_diff = ((score_a["standard_error"] ** 2) + (score_b["standard_error"] ** 2)) ** 0.5
+    if se_diff == 0:
+        z = float("inf") if diff != 0 else 0.0
+        p_value = 0.0 if diff != 0 else 1.0
+    else:
+        z = diff / se_diff
+        p_value = 2 * scipy_stats.norm.sf(abs(z))
+    return {
+        "score_difference": diff,
+        "standard_error_of_difference": round(se_diff, 4),
+        "z_statistic": round(z, 4) if z not in (float("inf"), float("-inf")) else z,
+        "p_value": round(float(p_value), 6),
+        "significant_at_0_05": bool(p_value < 0.05),
+    }
